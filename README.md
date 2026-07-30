@@ -54,6 +54,21 @@ createService(
 )
 ```
 
+### TLS connection options via environment
+
+For `amqps://` connections, TLS settings can be overridden with environment
+variables — useful for supplying a private CA or relaxing verification in a
+deployment without changing code:
+
+| Variable              | Effect                                                                |
+| --------------------- | --------------------------------------------------------------------- |
+| `CA`                  | Inline PEM certificate(s) to trust as the CA.                         |
+| `CA_FILE`             | Path to a PEM file to trust as the CA (`CA` wins when both are set).  |
+| `REJECT_UNAUTHORIZED` | Set to `false`/`0`/`no` to disable certificate verification.          |
+
+These are a **fallback**: any matching value passed in code via
+`connectionOptions` (`ca`, `rejectUnauthorized`) takes precedence.
+
 ### Return value
 
 `createService` returns a `ServiceApi` object immediately (the connection is established in the background):
