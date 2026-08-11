@@ -234,6 +234,244 @@ await service.act(messageKey, async (api) => {
 
 `act()` also supports returning a value or an iterable directly from the actor function, which behaves the same as calling `api.send()` for each value.
 
+### One instance per defer key — your lock, not ours
+
+> **You own the exclusivity.** You own the pending-key storage, so you own the
+> lock. A single connection refuses a key it is already acting on, but that check
+> is per-connection and in memory: **two replicas that both load the pending keys
+> on boot will both `act()` the same key**, both register callbacks, and both
+> render — and whoever rendered last takes the surface over.
+
+Requence does not arbitrate this: enforcing it would need cross-replica holder
+state plus a takeover path, so a dead holder could not block a key forever.
+Instead the symptom is made loud — when a render replaces a surface that is still
+live on another connection, the server logs a `surface takeover` error naming both
+connections.
+
+Take a lease on the key in your own store before acting (`SELECT … FOR UPDATE SKIP
+LOCKED`, a Redis `SET NX`, one designated attacher), and only act on keys you hold.
+
+`act()` is also the live window of a deferred node, so it can draw and redraw the
+node's [surface](#surfaces--a-ui-of-your-own-on-the-node) — see
+[`api.render`](#apirenderui-props-options--rendering-from-act).
+
+## Surfaces — a UI of your own on the node
+
+A service can ship its own UI component and have Requence render it **on the
+publishing node** in the task canvas, inside a sandboxed iframe. There is no UI
+protocol: the contract is **props**, and a function inside them arrives in the
+component as an invokable function.
+
+This section is the reference for surface behaviour in every SDK — the Python SDK
+(`python/README.md`) publishes the same render payload and answers the same
+invocation. The design authority is
+[`knowledge/service-ui-surfaces.md`](../../knowledge/service-ui-surfaces.md).
+
+### `createUI(url, defaults?)` — where a component comes from
+
+```typescript
+const ui = createUI<{ title: string; at: string; dense: boolean }>(
+  // A URL, so it resolves against THIS module — not against whatever directory
+  // the service was started from. `{ url, id }` instead overrides the stable id,
+  // which defaults to the built file's name.
+  new URL('./dist/panel.js', import.meta.url),
+  // Optional default props: what does not change from one message to the next.
+  { dense: true },
+)
+
+// A render carries only what differs.
+ctx.render(ui, { title: 'Processing', at: new Date().toISOString() })
+```
+
+**A render is a patch.** What the surface shows is the *fold* of three layers —
+the UI's defaults, everything previously rendered onto that surface, and this
+render — so redrawing one field takes one prop and leaves the rest standing:
+
+```typescript
+ctx.render(ui, { title: 'Processing', at: now() })
+ctx.render(ui, { at: now() })          // still says "Processing"
+ctx.render(ui, { title: 'Done' })      // and still carries the last `at`
+```
+
+The merge is **shallow**: a nested object is replaced wholesale, so changing part
+of one means restating that subtree. Nothing is ever removed — an omitted prop
+means "nothing to say about this", which is what makes a render a patch — so a
+prop is taken back by saying something else about it (`{ error: null }`).
+
+Defaults are the **weakest** layer: they are what a surface shows until some
+render says otherwise, and a render that overrides one keeps it overridden for
+every later render that stays silent about it. The flip side of all of this is
+that every render's props are optional in TypeScript, so it can no longer catch a
+*first* render that forgot half of them — completing the fold is yours.
+
+The bundle is read and hashed once, at registration, and capped at 1 MiB — an
+oversized component fails at startup rather than on its first render in
+production. Requence never bundles for you: build the component with your own
+toolchain into one ES module with a default `mount(element, ctx)` export.
+
+**In React, you do not write `mount`.** Leave `react`, `react-dom/client`,
+`react/jsx-runtime` and `@requence/surface-ui` external and the surface host
+resolves them from its shared runtime — which also ships `createSurface`, so the
+component is one default export and the surface state is its own props:
+
+```tsx
+import { Button, createSurface, Stack, Text } from '@requence/surface-ui'
+
+import type { PropsOf } from '@requence/service'
+import type { buttonUI } from './button.ts'
+
+export default createSurface<PropsOf<typeof buttonUI>>(({ props, canInvoke }) => (
+  <Stack space={2}>
+    <Button disabled={!canInvoke} onClick={() => props.onClick()}>
+      {props.label}
+    </Button>
+    <Text variant="muted">{props.clicks} dispatched</Text>
+  </Stack>
+))
+```
+
+No root, no `useState`, no `useEffect`, no teardown to forget. Anything nested
+reads the same state with `useSurface<Props>()` instead of having `canInvoke`
+drilled down to it. A bundle that ships its own React writes `mount` itself —
+create a root, subscribe to `ctx.onUpdate`, unmount on teardown.
+
+Every component also has a **stable id** — its built file's name, or whatever
+`createUI({ url, id })` says. It survives rebuilds and restarts, which the content
+hash deliberately does not, and it is what a durable handler is addressed by. Two
+handles claiming one id is a startup error, so two `index.js`-shaped components —
+or one file registered twice with different defaults — need explicit ids.
+
+### Handler props — where you write the function decides how long it can be pressed
+
+A function in a surface's props arrives in the component as an invokable function.
+There are two kinds, and you pick by **where you write it**:
+
+```typescript
+const askUI = createUI<{ question: string; onSubmit(answer: string): void }>(
+  new URL('./dist/ask.js', import.meta.url),
+  {
+    // DURABLE. Module scope, so any instance of this version can run it — this
+    // one, or the one that replaces it in a redeploy. An invocation waits in the
+    // version's handler queue for ~60s, so the handler below is free to defer
+    // and exit, and a rolling restart is invisible to the viewer.
+    onSubmit(answer) {
+      void record(answer)
+    },
+  },
+)
+
+const service = createService('1.0.0', function* (ctx) {
+  ctx.render(askUI, {
+    question: 'ship it?',
+    // CONNECTION-BOUND. Closes over this running handler, so only this process
+    // can serve it and it dies when the handler returns — which is also why it
+    // needs a generator handler.
+    onSubmit: (answer) => ctx.debug.log(answer),
+  })
+})
+```
+
+A durable handler gets **no injected context**: it reaches `service.act()`, your
+stores, anything else through its own closure, exactly as a module-scope function
+would in any other process of the version. An invocation naming a component or a
+prop path this process does not have is reported on stderr and dropped — the click
+behind it was accepted long before, so there is no request left to fail.
+
+Consuming the handler queue is automatic. It is `service-<name>@<version>-handlers`,
+one per version, created by Requence when the version is provisioned and asserted
+again by the SDK on connect.
+
+**A durable handler still needs someone home.** The node can wait days; the
+*click* cannot. While no instance of the version is running, every handler prop of
+that version's surfaces reports `reachable: false` and the component withholds its
+control — and an invocation that does get published expires in the queue after
+~60s and is reported back to the viewer beside the surface, in Requence's own
+error box, rather than running whenever somebody next deploys. So
+the queue rides out a redeploy, not a weekend. Scale your version to zero and the
+buttons it drew go quiet until you scale it back up, at which point they come back
+on the open page with no reload.
+
+### `api.render(ui, props, options?)` — rendering from `act()`
+
+A deferring handler cannot register a *connection-bound* handler at all (they die
+the moment it returns), so a surface whose buttons are written inline has to be
+rendered from the [actor](#deferred-delivery-via-serviceact) — where they belong to
+the `act()` call and live exactly as long as it does. (A handler written in the UI's
+own defaults is durable and needs none of this.)
+
+```typescript
+const ui = createUI(new URL('./dist/button.js', import.meta.url))
+
+const service = createService('1.0.0', (ctx) => {
+  pending.save(ctx.defer('waiting for a click'))
+})
+
+await service.open()
+
+// On boot AND after each defer — this loop is what survives a restart.
+for (const key of await pending.all()) {
+  void attach(key)
+}
+
+async function attach(key: string) {
+  const clicks = asyncEventEmitter<{ timestamp: number }>()
+
+  await service.act(key, async (api) => {
+    api.render(ui, {
+      onClick: createCallback<{ timestamp: number }>((arg) => clicks.push(arg)),
+    })
+
+    for await (const click of clicks) {
+      api.send(click) // completes the deferred node
+      break
+    }
+  })
+
+  await pending.remove(key)
+}
+```
+
+Restart the process, reload the keys, `act()` again: the new render — fresh
+connection, fresh callbacks — replaces the stale surface, and the browser needs to
+know nothing about it. `props` is type-checked against `createUI<Props>` exactly as
+it is for `ctx.render`.
+
+### Three rules a component author does not get to skip
+
+The design took these deliberately, and none of them is enforced for you.
+
+**1. A handler's argument comes from the browser, and it is forgeable.** A viewer
+with `task: UPDATE` can invoke any handler reference the stored props hold, with
+anything under the byte cap — the component that was rendered is not what sends it.
+Requence bounds *which* handler (only a reference some render actually published)
+and *how big* the argument is, and deliberately nothing else: no schema declares an
+author's props anywhere on the wire, and a handler is ordinary service code that can
+check its own input. **Validate the argument in the handler**, exactly as you would
+a webhook body — and keep anything the handler must not be *told* in its closure
+rather than in the props. A durable handler reading `arg.deferKey` is fine (a key is
+single-use and belongs to that node); the same handler reading `arg.amount` or
+`arg.userId` is not.
+
+**2. An interaction is *accepted*, not awaited.** The click returns the moment the
+command is on the task's shard: a handler prop returns `void`, there is no promise
+and no request left to answer — a durable handler may run minutes later, in a
+process the viewer never had a connection to. **Feedback is a re-render**: state
+what happened in the props (`{ submitted: true }`, `{ error: 'unknown address' }`)
+and let the component read them through `ctx.onUpdate`. Two consequences a component
+must respect — it may not lock itself optimistically (nothing on the server changed,
+so no update arrives to unlock it), and a design that needs a synchronous answer
+needs a different shape.
+
+**3. Network egress is open, and the sandbox denies credentials.** A component may
+`fetch` any URL and load images, fonts and media from any host (plus `data:` and
+`blob:`); only `script-src` stays closed, so it can send data out but cannot pull
+code in. Its origin is opaque, so it carries **no cookies** and `Origin: null` — it
+acts on its own behalf, never as the viewer, and cannot reach an authenticated
+endpoint of your deployment. Therefore **never put a credential in props for the
+component to fetch with**: the service fetches and re-renders. The flip side is the
+accepted cost — third-party component code holds the props you sent it and can post
+them anywhere, unaudited.
+
 ## Dev Overlay
 
 When developing locally alongside a production service, use a **dev token** (your personal access token) to register a dev instance. Requence routes your own tasks to the dev instance instead of the production pool:
@@ -251,6 +489,26 @@ createService(
 ```
 
 The dev token is resolved in the same order as the access token — option, `REQUENCE_SERVICE_DEV_TOKEN` / `REQUENCE_DEV_TOKEN` env var, or `requence.service.devToken` / `requence.devToken` in `package.json`.
+
+### Component reload
+
+A dev instance watches the built file behind every `createUI`. Rebuild it and the
+frame swaps to the new bundle in place — same props, same handlers, same node,
+no re-render and no new task.
+
+It reaches every surface your dev session ever drew, and nothing else: a live
+panel, a form on a node that is still deferred, and a surface on a task that
+finished last week all swap alike, while a production surface of the same
+component is untouched. Restarting your service does not strand the surfaces it
+drew a moment before.
+
+One limit worth knowing: what swaps is the code, never the props. A component
+that only shows what the last render sent it will show exactly that, until your
+service renders again.
+
+While your dev process is stopped, the surfaces it drew report their handlers as
+unreachable and say so in those terms — *the dev process that drew this surface is
+not running* — not as a missing deployment. Start it again and they come back.
 
 ## CLI — Generate Types
 
