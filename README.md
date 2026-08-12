@@ -255,6 +255,169 @@ LOCKED`, a Redis `SET NX`, one designated attacher), and only act on keys you ho
 node's [surface](#surfaces--a-ui-of-your-own-on-the-node) — see
 [`api.render`](#apirenderui-props-options--rendering-from-act).
 
+## Callbacks — functions you emit alongside your data
+
+A function in what a service emits arrives downstream as a function the graph may
+call back. An email receiver yields a mail *and* a `delete()` a later node may or
+may not use.
+
+This section is the reference for callback behaviour in every SDK — the Python SDK
+(`python/README.md`) speaks the same wire and states only where it differs. The
+design authority is
+[`knowledge/durable-callbacks.md`](../../knowledge/durable-callbacks.md).
+
+### Where you write the function decides how long it lives
+
+There are two kinds, and you pick by **where you write it** — the same rule as
+[handler props](#handler-props--where-you-write-the-function-decides-how-long-it-can-be-pressed),
+stated for a second mechanism:
+
+```typescript
+import { createDurableCallback, createService } from '@requence/service'
+
+// DURABLE. Declared ONCE at module scope, addressed by the name it is given. It
+// closes over nothing per mail, so any instance of this version can run it —
+// this one, or the one that replaces it in a redeploy.
+const deleteMail = createDurableCallback<null, { uid: number }, 'receiver'>(
+  'deleteMail',
+  async (_arg, { uid, configuration }) => {
+    const client = await connect(configuration) // rebuilt, never captured
+    await client.messageDelete([uid], { uid: true })
+    client.close()
+  },
+)
+
+createService('receiver', async function* () {
+  for await (const mail of mails) {
+    yield {
+      subject: mail.subject,
+      // A reference, not a closure: one registration, however many mails.
+      delete: deleteMail.for({ uid: mail.uid }),
+      // CONNECTION-BOUND. Needs the LIVE imap client, so it correctly dies with
+      // this message — and holds everything it captured until then.
+      stream: () => imap.download(mail.uid),
+    }
+  }
+})
+```
+
+**Write it inline when it genuinely needs the live process** — an open stream, a
+client the handler is mid-conversation with. **Declare it with
+`createDurableCallback` when it needs only data**, and bind that data with
+`.for(…)`.
+
+A connection-bound function is kept in the connection's registry until the message
+**settles**, which for a CONTINUOUS handler is until the task *ends*. So a generator
+minting one per emission grows by one closure per emission for the life of the run,
+and each closure holds on to everything that was in scope when it was written — the
+whole mail, not just the uid. It is also why a connection-bound callback is only
+useful from a generator handler: a LINEAR handler's registrations go the moment it
+returns, so the reference it emitted is dead before anything downstream sees it. A
+durable one registers nothing, so a LINEAR node can emit one and a later node can
+still call it.
+
+### What a durable callback is handed
+
+```typescript
+createDurableCallback<Arg, Bound, Configuration>(name, (arg, context) => …)
+```
+
+| | |
+|---|---|
+| `arg` | what the graph passed when it called the callback |
+| `context.…` | whatever `.for({ … })` bound to this emission, spread |
+| `context.configuration` | the node's **static** configuration |
+
+**And that is all of it.** No message, no task, no connection — that is exactly what
+makes it durable: it may run in an instance that never saw the emission, started
+after the emitting process died. So anything it needs it **rebuilds** rather than
+captures, and `configuration` is what it rebuilds from.
+
+The three type arguments are the three things the two sides disagree about, and
+`Configuration` takes either a type or the **name of the service version** to look it
+up from (`ConfigurationOf<'receiver'>`). **Prefer the version-name form**: that type
+is generated into `requence-env.d.ts` beside the version it belongs to, so naming the
+version is the only form that cannot drift from what the node actually sends.
+
+A binding may not be:
+
+- **a scalar.** The bound data *is* the context and it is spread, so a string would
+  quietly become `{ 0: 'd', 1: 'e', … }`.
+- **a `configuration` key.** The node's own configuration has that name, and a
+  precedence rule either way would mean your data or the node's credentials silently
+  disappearing.
+
+Both are refused where you wrote them, and again when an invocation is unpacked.
+
+A declaration with nothing to bind is emitted as itself — `.for()` is optional there,
+and TypeScript only lets you leave it off when there is genuinely nothing to bind:
+
+```typescript
+const acknowledge = createDurableCallback<null>('acknowledge', () => ack())
+
+yield { subject: mail.subject, acknowledge }
+```
+
+**A callback that takes no argument is `RequenceCallback<null>`, not `<void>`** —
+both here and in the output schema the position is declared in. `void` has no root
+type a JSON schema can hold, so the schema cannot be authored at all, and
+`undefined` compiles but silently drops the `callback` marker along with the
+argument, leaving a plain object where the reference has to survive validation. A
+graph then calls it as `context.input.delete(null)`.
+
+**Two declarations under the same name throw at registration**, for the reason a
+duplicate `createUI` id does: the name is the whole address, so an ambiguous one is an
+invocation reaching the *wrong* handler — which reads like a bug in the handler — and
+that is worse than a service that refuses to start.
+
+### An invocation waits out a redeploy, not a weekend
+
+Consuming the invocations is automatic. The queue is
+`service-<name>@<version>-callbacks`, one per version, created by Requence when the
+version is provisioned and asserted again by the SDK on connect. Whichever instance is
+free serves it, so a rolling restart is invisible to the graph.
+
+It is **not a mailbox**: an invocation expires after ~60s, and an expired or
+unroutable one is reported on the run — a system note on the node that emitted the
+callback, saying whether the version has nothing running or is no longer deployed at
+all. A callback invoked today and run whenever somebody next deploys would be a silent
+effect, and nothing checks that a service is up before a graph calls
+`context.input.delete()`.
+
+A name this build does not declare, and a handler that throws, are said out loud in
+this process's log — the graph called the callback and moved on, so there is no
+request left to fail. The invocation is **acked either way**: a requeue would rerun a
+side-effecting callback forever.
+
+### The pile-up warning
+
+If connection-bound callbacks accumulate, the SDK tells you in its **own log** — once
+when the registry crosses a threshold, then at each power of ten — naming the `yield`
+positions doing it and the fix:
+
+| Where | First warning | Then |
+|---|---|---|
+| a dev session (dev overlay) | 100 | ×10 |
+| a deployed version | 1 000 | ×10 (10k, 100k, …) |
+
+A dev session warns ten times earlier on purpose: a hundred emissions in `bun run dev`
+already means a generator is minting closures in a loop, and catching it there is worth
+far more than catching it in production. Two counters feed it — this delivery's, which
+identifies the one generator, and the whole connection's, which is what actually
+threatens the process when many tasks each stay under their own threshold.
+
+It is a **log line for you**, not a task event: you are the only person who can act on
+it. Nothing is capped and nothing is evicted — a cap would kill a legitimate long-lived
+handle at an arbitrary number you cannot exempt it from.
+
+### Two gaps
+
+- **Computed configuration is not available to a durable callback**, and cannot be:
+  config functions are evaluated per dispatch, and this call belongs to none. A node
+  whose credentials are computed cannot serve one.
+- **A logic node's `createCallback` global is connection-bound only.** There is no
+  durable form inside a script.
+
 ## Surfaces — a UI of your own on the node
 
 A service can ship its own UI component and have Requence render it **on the
