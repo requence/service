@@ -31,7 +31,7 @@ REQUENCE_SERVICE_ACCESS_TOKEN=your-token bun run index.ts
 ## Your first service
 
 Create the service in the Requence UI first — its input schema, configuration schema and
-outputs. Then implement the version:
+outputs. Then implement the variant:
 
 ```typescript
 import { createService } from '@requence/service'
@@ -41,7 +41,7 @@ createService('1.0.0', (ctx) => {
 })
 ```
 
-The second argument to `createService` is the **version** of the service definition you are
+The first argument to `createService` is the **variant** of the service definition you are
 implementing. When Requence dispatches a message, the handler runs and the return value is sent
 back as the result.
 
@@ -62,7 +62,7 @@ npx requence-service generate-types
 | `service.open()`, `service.close()`                                      | [Starting & Stopping][lifecycle]                            |
 | Generator handlers and `ctx.terminated`                                  | [Continuous Mode][continuous]                               |
 | `ctx.store` — what a node remembers past this message                    | [The Store][store] · [`ctx.store`][context-store]           |
-| `createDurableCallback`, `.for(…)`, the per-version queue                | [Callbacks][callbacks]                                      |
+| `createDurableCallback`, `.for(…)`, the per-variant queue                | [Callbacks][callbacks]                                      |
 | `createUI`, `ctx.render`, handler props                                  | [Surfaces][surfaces]                                        |
 | `ctx.defer()` → `service.act()`                                          | [Deferred Delivery][deferred]                               |
 | `wrapIterable`, `asyncEventEmitter`                                      | [Utility Helpers][utilities]                                |
